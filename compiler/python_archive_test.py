@@ -13,14 +13,15 @@
 # limitations under the License.
 
 import os
-import stat
 import subprocess
+import sys
+import time
 import unittest
 import zipfile
 
 from subpar.compiler import error
-from subpar.compiler import stored_resource
 from subpar.compiler import python_archive
+from subpar.compiler import stored_resource
 from subpar.compiler import test_utils
 
 
@@ -45,8 +46,11 @@ class PythonArchiveTest(unittest.TestCase):
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
         self.output_filename = os.path.join(self.output_dir, 'output.par')
-        self.interpreter = '/usr/bin/python2'
+        self.interpreter = sys.executable
         self.import_roots = []
+        self.date_time_tuple = (1980, 1, 1, 0, 0, 0)
+        self.timestamp = 315532800
+        self.zip_safe = True
 
     def _construct(self, manifest_filename=None):
         return python_archive.PythonArchive(
@@ -56,6 +60,8 @@ class PythonArchiveTest(unittest.TestCase):
             manifest_filename=(manifest_filename or self.manifest_file.name),
             manifest_root=os.getcwd(),
             output_filename=self.output_filename,
+            timestamp=self.timestamp,
+            zip_safe=self.zip_safe,
         )
 
     def test_create_manifest_not_found(self):
@@ -79,7 +85,7 @@ class PythonArchiveTest(unittest.TestCase):
     def test_create_source_file_not_found(self):
         with test_utils.temp_file(b'foo.py doesnotexist.py\n') as manifest_file:
             par = self._construct(manifest_filename=manifest_file.name)
-            with self.assertRaises(OSError):
+            with self.assertRaises((IOError, OSError)):
                 par.create()
 
     def test_create_permission_denied_creating_temp_file(self):
@@ -106,6 +112,22 @@ class PythonArchiveTest(unittest.TestCase):
         self.assertTrue(os.path.exists(self.output_filename))
         self.assertEqual(
             subprocess.check_output([self.output_filename]), b'Hello World!\n')
+
+    def test_create_deterministic(self):
+        par1 = self._construct()
+        self.output_filename = self.output_filename + '2'
+        par2 = self._construct()
+
+        par1.create()
+        # Sleep for 3 seconds, which is greater than the 2-second
+        # granularity of zip timestamps
+        time.sleep(3)
+        par2.create()
+
+        # The two par files should be bit-for-bit identical
+        content1 = open(par1.output_filename, 'rb').read()
+        content2 = open(par2.output_filename, 'rb').read()
+        self.assertEqual(content1, content2)
 
     def test_create_temp_parfile(self):
         par = self._construct()
@@ -139,6 +161,15 @@ class PythonArchiveTest(unittest.TestCase):
             # Future import
             (b'from __future__ import print_function\n',
              b'from __future__ import print_function\nBOILERPLATE\n'),
+            # Module docstrings
+            (b"'Single-quote Module docstring'\n",
+             b"'Single-quote Module docstring'\nBOILERPLATE\n"),
+            (b'"Double-quote Module docstring"\n',
+             b'"Double-quote Module docstring"\nBOILERPLATE\n'),
+            (b"'''Triple-single-quote module \"'\n\n docstring'''\n",
+             b"'''Triple-single-quote module \"'\n\n docstring'''\nBOILERPLATE\n"),
+            (b'"""Triple-double-quote module "\'\n\n docstring"""\n',
+             b'"""Triple-double-quote module "\'\n\n docstring"""\nBOILERPLATE\n'),
         ]
         for main_content, expected in cases:
             with test_utils.temp_file(main_content) as main_file:
@@ -147,16 +178,17 @@ class PythonArchiveTest(unittest.TestCase):
 
     def test_scan_manifest(self):
         par = self._construct()
-        manifest = {'foo.py': '/something/foo.py', 'bar.py': None,}
+        manifest = {'foo.py': '/something/foo.py', 'bar.py': None}
         resources = par.scan_manifest(manifest)
         self.assertIn('foo.py', resources)
         self.assertIn('bar.py', resources)
 
     def test_scan_manifest_adds_workspace_roots(self):
         par = self._construct()
-        manifest = {'foo': None, 'bar/': None, 'baz/quux': None,}
+        manifest = {'foo': None, 'bar/': None, 'baz/quux': None}
         resources = par.scan_manifest(manifest)
-        self.assertIn(b"import_roots=['bar', 'baz']", resources['__main__.py'].content)
+        self.assertIn(b"import_roots=['bar', 'baz']",
+                      resources['__main__.py'].content)
 
     def test_scan_manifest_adds_main(self):
         par = self._construct()
@@ -193,13 +225,23 @@ class PythonArchiveTest(unittest.TestCase):
             self.assertNotEqual(actual, '')
 
     def test_write_zip_data(self):
+        # Create simple .par file
         par = self._construct()
-        with par.create_temp_parfile() as t:
+        with par.create_temp_parfile() as output_file:
+            stored_name = os.path.basename(self.main_file.name)
             resource = stored_resource.StoredFile(
-                os.path.basename(self.main_file.name), self.main_file.name)
-            resources = {resource.stored_filename: resource,}
-            par.write_zip_data(t, resources)
-        self.assertTrue(zipfile.is_zipfile(t.name))
+                stored_name, self.date_time_tuple, self.main_file.name)
+            resources = {resource.zipinfo.filename: resource}
+            par.write_zip_data(output_file, resources)
+        output_file.close()
+
+        # Check that it's a valid zipfile
+        self.assertTrue(zipfile.is_zipfile(output_file.name))
+
+        # Check that the file was stored correctly
+        z = zipfile.ZipFile(output_file.name)
+        zipinfo = z.getinfo(stored_name)
+        self.assertEqual(zipinfo.date_time, self.date_time_tuple)
 
     def test_create_final_from_temp(self):
         par = self._construct()
@@ -212,6 +254,9 @@ class PythonArchiveTest(unittest.TestCase):
 
 class ModuleTest(unittest.TestCase):
     """Test module scope functions"""
+
+    def setUp(self):
+        self.date_time_tuple = (1980, 1, 1, 0, 0, 0)
 
     def test_remove_if_present(self):
         tmpdir = test_utils.mkdtemp()
@@ -227,7 +272,10 @@ class ModuleTest(unittest.TestCase):
         self.assertFalse(os.path.exists(filename))
 
     def test_fetch_support_file(self):
-        resource = python_archive.fetch_support_file('__init__.py')
+        resource = python_archive.fetch_support_file(
+            'support.py', self.date_time_tuple)
+        self.assertEqual(resource.zipinfo.filename, 'subpar/runtime/support.py')
+
 
 if __name__ == '__main__':
     unittest.main()

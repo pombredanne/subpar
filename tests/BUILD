@@ -11,14 +11,13 @@ exports_files([
 ])
 
 load("//:subpar.bzl", "par_binary")
+load("//:toolchain_test_hook.bzl", "PYVER", "define_toolchain_for_testing")
 
-# Configurations
-config_setting(
-    name = "subpar_test_python_version_3",
-    define_values = {
-        "subpar_test_python_version": "3",
-    },
-)
+# Creates the target //tests:toolchain_for_testing.
+#
+# This hook is used by run_tests.sh to inject a Python toolchain into the build
+# during tests. When not running tests this hook is a no-op.
+define_toolchain_for_testing()
 
 # Utility targets
 sh_library(
@@ -65,20 +64,39 @@ par_binary(
 
 par_binary(
     name = "package_f/f",
-    srcs = select({
-        "subpar_test_python_version_3": ["package_f/f_PY3.py"],
-        "//conditions:default": ["package_f/f_PY2.py"],
-    }),
-    main = select({
-        "subpar_test_python_version_3": "package_f/f_PY3.py",
-        "//conditions:default": "package_f/f_PY2.py",
-    }),
+    # We need to use the PYVER constant defined by the test hook, rather than
+    # select(), because python_version is not a configurable attribute.
+    srcs = ["package_f/f_PY3.py"] if PYVER == "PY3" else ["package_f/f_PY2.py"],
+    main = "package_f/f_PY3.py" if PYVER == "PY3" else "package_f/f_PY2.py",
+    python_version = "PY3" if PYVER == "PY3" else "PY2"
 )
 
 par_binary(
-    name = "package_g/g",
-    srcs = ["package_g/g.py"],
-    main = "package_g/g.py",
+    name = "package_boilerplate/main",
+    srcs = ["package_boilerplate/main.py"],
+    main = "package_boilerplate/main.py",
+    srcs_version = "PY2AND3",
+)
+
+par_binary(
+    name = "package_extract/extract",
+    srcs = [
+        "package_extract/extract.py",
+        "package_extract/extract_helper.py",
+        "package_extract/extract_helper_package/__init__.py",
+    ],
+    data = ["package_extract/extract_helper_package/extract_dat.txt"],
+    imports = ["package_extract"],
+    main = "package_extract/extract.py",
+    srcs_version = "PY2AND3",
+    zip_safe = False,
+)
+
+par_binary(
+    name = "package_import_roots/import_roots",
+    srcs = ["package_import_roots/import_roots.py"],
+    imports = ["package_import_roots"],
+    main = "package_import_roots/import_roots.py",
     srcs_version = "PY2AND3",
 )
 
@@ -95,12 +113,15 @@ par_binary(
 )
 
 par_binary(
-    name = "package_import_roots/import_roots",
+    name = "package_pkg_resources/main",
     srcs = [
-        "package_import_roots/import_roots.py",
+        "package_pkg_resources/main.py",
     ],
-    imports = ["package_import_roots"],
-    main = "package_import_roots/import_roots.py",
+    data = [
+        "@pypi__portpicker_1_2_0//:files",
+        "@pypi__yapf_0_19_0//:files",
+    ],
+    main = "package_pkg_resources/main.py",
     srcs_version = "PY2AND3",
 )
 
@@ -112,10 +133,10 @@ par_binary(
         size = "small",
         srcs = ["test_harness.sh"],
         args = [
-            "tests%s" % path,
+            path,
         ],
         data = [
-            "//tests%s" % label,
+            label,
         ],
     ),
     # Test .par file with harness
@@ -125,26 +146,42 @@ par_binary(
         srcs = ["test_harness.sh"],
         args = [
             "--par",
-            "tests%s.par" % path,
-        ] + select({
-            "subpar_test_python_version_3": ["tests%s_PY3_filelist.txt" % path],
-            "//conditions:default": ["tests%s_PY2_filelist.txt" % path],
-        }),
+            "%s.par" % path,
+            ("%s_PY3_filelist.txt" % path) if PYVER == "PY3" else ("%s_PY2_filelist.txt" % path)
+        ],
         data = [
-            "//tests%s.par" % label,
-        ] + select({
-            "subpar_test_python_version_3": ["//tests%s_PY3_filelist.txt" % label],
-            "//conditions:default": ["//tests%s_PY2_filelist.txt" % label],
-        }),
+            "%s.par" % label,
+            ("%s_PY3_filelist.txt" % label) if PYVER == "PY3" else ("%s_PY2_filelist.txt" % label)
+        ],
     ),
 ) for name, label, path in [
-    ("basic", "/package_a:a", "/package_a/a"),
-    ("direct_dependency", "/package_b:b", "/package_b/b"),
-    ("indirect_dependency", ":package_c/c", "/package_c/c"),
-    ("import_root", ":package_d/d", "/package_d/d"),
-    ("external_workspace", ":package_e/e", "/package_e/e"),
-    ("version", ":package_f/f", "/package_f/f"),
-    ("main_boilerplate", ":package_g/g", "/package_g/g"),
-    ("shadow", ":package_shadow/main", "/package_shadow/main"),
-    ("import_roots", ":package_import_roots/import_roots", "/package_import_roots/import_roots"),
+    ("basic", "//tests/package_a:a", "tests/package_a/a"),
+    (
+        "dir_shadowing",
+        "//test_dir_shadowing:test_dir_shadowing_main",
+        "test_dir_shadowing/test_dir_shadowing_main",
+    ),
+    ("direct_dependency", "//tests/package_b:b", "tests/package_b/b"),
+    ("external_workspace", "//tests:package_e/e", "tests/package_e/e"),
+    ("extract", "//tests:package_extract/extract", "tests/package_extract/extract"),
+    ("import_root", "//tests:package_d/d", "tests/package_d/d"),
+    (
+        "import_roots",
+        "//tests:package_import_roots/import_roots",
+        "tests/package_import_roots/import_roots",
+    ),
+    ("indirect_dependency", "//tests:package_c/c", "tests/package_c/c"),
+    ("main_boilerplate", "//tests:package_boilerplate/main", "tests/package_boilerplate/main"),
+    ("pkg_resources", "//tests:package_pkg_resources/main", "tests/package_pkg_resources/main"),
+    ("shadow", "//tests:package_shadow/main", "tests/package_shadow/main"),
+    ("version", "//tests:package_f/f", "tests/package_f/f"),
 ]]
+
+# Test target in external workspace
+sh_test(
+    name = "test_compiler_label_wrapper",
+    srcs = ["test_compiler_label_wrapper.sh"],
+    data = [
+        "@test_workspace//:test_compiler_label.par",
+    ],
+)

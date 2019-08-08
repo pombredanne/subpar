@@ -19,9 +19,10 @@ Test Python3 specific functionality
 
 import sys
 
+
 def main():
     assert sys.version_info.major == 3, sys.version
-    print('In f_PY2.py main()')
+    print('In f_PY3.py main()')
 
 
 if __name__ == '__main__':

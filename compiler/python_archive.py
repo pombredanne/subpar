@@ -28,6 +28,9 @@ See also https://www.python.org/dev/peps/pep-0441/
 
 """
 
+from datetime import datetime
+import contextlib
+import errno
 import io
 import logging
 import os
@@ -45,10 +48,31 @@ from subpar.compiler import stored_resource
 _boilerplate_template = """\
 # Boilerplate added by subpar/compiler/python_archive.py
 from %(runtime_package)s import support as _
-_.setup(import_roots=%(import_roots)s)
+_.setup(import_roots=%(import_roots)s, zip_safe=%(zip_safe)s)
 del _
 # End boilerplate
 """
+
+# Boilerplate must be after the last __future__ import.  See
+# https://docs.python.org/2/reference/simple_stmts.html#future
+_boilerplate_insertion_regex = re.compile('''(?sx)
+(?P<before>
+    (
+        (
+            ([#][^\\r\\n]*) | # comment
+            (\\s*) | # whitespace
+            (from\\s+__future__\\s+import\\s+[^\\r\\n]+) | # future import
+            ('[^'].*?') | # module doc comment form 1
+            ("[^"].*?") | # module doc comment form 2
+            (\'\'\'.*?(\'\'\')) | # module doc comment form 3
+            (""".*?""") # module doc comment form 4
+        )
+        [\\r\\n]+ # end of line(s) for Mac, Unix and/or Windows
+    )*
+)
+# Boilerplate is inserted here
+(?P<after>.*)
+''')
 
 # Fully qualified names of subpar packages
 _subpar_package = 'subpar'
@@ -56,7 +80,7 @@ _compiler_package = _subpar_package + '.compiler'
 _runtime_package = _subpar_package + '.runtime'
 
 # List of files from the runtime package to include in every .par file
-_runtime_support_files = ['support.py',]
+_runtime_support_files = ['support.py']
 
 # List of zero-length files to include in every .par file
 _runtime_init_files = [
@@ -76,7 +100,9 @@ class PythonArchive(object):
                  manifest_filename,
                  manifest_root,
                  output_filename,
-                ):
+                 timestamp,
+                 zip_safe,
+                 ):
         self.main_filename = main_filename
 
         self.import_roots = import_roots
@@ -84,6 +110,10 @@ class PythonArchive(object):
         self.manifest_filename = manifest_filename
         self.manifest_root = manifest_root
         self.output_filename = output_filename
+        # Convert to the format ZipInfo expects
+        t = datetime.utcfromtimestamp(timestamp)
+        self.timestamp_tuple = t.timetuple()[0:6]
+        self.zip_safe = zip_safe
 
         self.compression = zipfile.ZIP_DEFLATED
 
@@ -141,6 +171,7 @@ class PythonArchive(object):
         boilerplate_contents = _boilerplate_template % {
             'runtime_package': _runtime_package,
             'import_roots': str(import_roots),
+            'zip_safe': self.zip_safe,
         }
         return boilerplate_contents.encode('ascii').decode('ascii')
 
@@ -156,24 +187,24 @@ class PythonArchive(object):
         # Read main source file, in unknown encoding.  We use latin-1
         # here, but any single-byte encoding that doesn't raise errors
         # would work.
-        output_lines = []
         with io.open(main_filename, 'rt', encoding='latin-1') as main_file:
-            output_lines = list(main_file)
+            original_content = main_file.read()
 
         # Find a good place to insert the boilerplate, which is the
-        # first line that is not a comment, blank line, or future
-        # import.
-        skip_regex = re.compile('''(#.*)|(\\s+)|(from\\s+__future__\\s+import)''')
-        idx = 0
-        while idx < len(output_lines):
-            if not skip_regex.match(output_lines[idx]):
-                break
-            idx += 1
+        # first line that is not a comment, blank line, doc comment,
+        # or future import.
+        match = re.match(_boilerplate_insertion_regex, original_content)
+        assert match, original_content
+        assert (len(match.group('before')) + len(match.group('after'))) == \
+                len(original_content), (match, original_content)
+        new_content = (match.group('before') +
+                       boilerplate_contents +
+                       match.group('after'))
 
         # Insert boilerplate (might be beginning, middle or end)
-        output_lines[idx:idx] = [boilerplate_contents]
-        contents = ''.join(output_lines).encode('latin-1')
-        return stored_resource.StoredContent('__main__.py', contents)
+        encoded_content = new_content.encode('latin-1')
+        return stored_resource.StoredContent(
+            '__main__.py', self.timestamp_tuple, encoded_content)
 
     def scan_manifest(self, manifest):
         """Return a dict of StoredResources based on an input manifest.
@@ -183,27 +214,29 @@ class PythonArchive(object):
         """
 
         # Extend the list of import roots to include workspace roots
-        all_import_roots = set(self.import_roots)
+        top_roots = set()
         for stored_path in manifest.keys():
             if '/' in stored_path:  # Zip file paths use / on all platforms
-                all_import_roots.add(stored_path.split('/', 1)[0])
-        import_roots = sorted(all_import_roots)
+                top_dir = stored_path.split('/', 1)[0]
+                if top_dir not in top_roots:
+                    top_roots.add(top_dir)
+        import_roots = list(self.import_roots) + sorted(top_roots)
 
         # Include some files that every .par file needs at runtime
         stored_resources = {}
         for support_file in _runtime_support_files:
-            resource = fetch_support_file(support_file)
-            stored_filename = resource.stored_filename
+            resource = fetch_support_file(support_file, self.timestamp_tuple)
+            stored_filename = resource.zipinfo.filename
             stored_resources[stored_filename] = resource
 
         # Scan manifest
         for stored_path, local_path in manifest.items():
             if local_path is None:
                 stored_resources[stored_path] = stored_resource.EmptyFile(
-                    stored_path)
+                    stored_path, self.timestamp_tuple)
             else:
                 stored_resources[stored_path] = stored_resource.StoredFile(
-                    stored_path, local_path)
+                    stored_path, self.timestamp_tuple, local_path)
 
         # Copy main entry point to well-known name
         if '__main__.py' in stored_resources:
@@ -221,7 +254,7 @@ class PythonArchive(object):
                               stored_filename)
                 continue
             stored_resources[stored_filename] = stored_resource.EmptyFile(
-                stored_filename)
+                stored_filename, self.timestamp_tuple)
 
         return stored_resources
 
@@ -243,10 +276,10 @@ class PythonArchive(object):
         """
 
         logging.debug('Storing Files...')
-        with zipfile.ZipFile(temp_parfile, 'w', self.compression) as z:
+        with contextlib.closing(zipfile.ZipFile(temp_parfile, 'w', self.compression)) as z:
             items = sorted(stored_resources.items())
             for relative_path, resource in items:
-                assert resource.stored_filename == relative_path
+                assert resource.zipinfo.filename == relative_path
                 resource.store(z)
 
     def create_final_from_temp(self, temp_parfile_name):
@@ -258,16 +291,22 @@ class PythonArchive(object):
 
 
 def remove_if_present(filename):
-    """Delete any existing file"""
-    if os.path.exists(filename):
+    """Delete a file if it exists"""
+    try:
+        # Remove atomically
         os.remove(filename)
+    except OSError as exc:
+        # Ignore failure if file does not exist
+        if exc.errno != errno.ENOENT:
+            raise
 
 
-def fetch_support_file(name):
+def fetch_support_file(name, timestamp_tuple):
     """Read a file from the runtime package
 
     Args:
         name: filename in runtime package's directory
+        timestamp_tuple: Stored timestamp, as ZipInfo tuple
 
     Returns:
         A StoredResource representing the content of that file
@@ -279,4 +318,5 @@ def fetch_support_file(name):
     if content is None:
         raise error.Error(
             'Internal error: Can\'t find runtime support file [%s]' % name)
-    return stored_resource.StoredContent(stored_filename, content)
+    return stored_resource.StoredContent(
+        stored_filename, timestamp_tuple, content)
